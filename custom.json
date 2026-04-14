@@ -1,0 +1,38 @@
+{
+  "models": {
+    "providers": {
+      "router": {
+        "api": "openai-completions",
+        "baseUrl": "http://router:4100/v1",
+        "models": [
+          { "id": "auto", "name": "Auto-Route (LLM Router)", "contextWindow": 32768 }
+        ],
+        "apiKey": "router-local"
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": { "primary": "router/auto" },
+      "memorySearch": {
+        "provider": "ollama",
+        "model": "nomic-embed-text",
+        "remote": { "baseUrl": "http://192.168.1.165:11434" }
+      }
+    }
+  },
+  "channels": {
+    "discord": {
+      "enabled": true,
+      "groupPolicy": "allowlist",
+      "dmPolicy": "open",
+      "allowFrom": ["*"],
+      "guilds": {
+        "1471889480435634398": {
+          "requireMention": false,
+          "users": ["601310005194522624"]
+        }
+      }
+    }
+  }
+}
