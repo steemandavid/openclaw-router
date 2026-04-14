@@ -15,6 +15,7 @@ OpenClaw sends OpenAI-format requests. The router:
 """
 
 import os
+import re
 import time
 import json
 import logging
@@ -104,6 +105,92 @@ TIERS: dict[Tier, Backend] = {
         api_key=ZAI_API_KEY,
     ),
 }
+
+# ---------------------------------------------------------------------------
+# Model attribution — appended to every Discord response
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class UsageStats:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read: int = 0
+    cache_created: int = 0
+    max_output_tokens: int = 0
+    response_model: str = ""
+
+
+# Approximate context window sizes for known model families
+_CONTEXT_WINDOWS: dict[str, int] = {
+    "qwen2.5": 131072,
+    "qwen3": 131072,
+    "claude-sonnet": 200000,
+    "claude-opus": 200000,
+    "claude-haiku": 200000,
+    "glm-4": 128000,
+    "glm-5": 128000,
+}
+
+
+def _get_provider_name(backend: Backend) -> str:
+    """Determine the display provider name from the backend configuration."""
+    url = backend.url.lower()
+    if "z.ai" in url:
+        return "z.ai"
+    if "11434" in url or "ollama" in url:
+        return "Ollama"
+    # Fallback: extract hostname
+    return url.split("//")[1].split("/")[0].split(":")[0]
+
+
+def _build_attribution(backend: Backend, stats: UsageStats | None = None) -> str:
+    """Build model/provider + usage stats attribution line for Discord."""
+    provider = _get_provider_name(backend)
+    # Use the actual model name from the upstream response when available
+    display_model = (stats.response_model if stats and stats.response_model else backend.model)
+    parts = [f"— {display_model} via {provider}"]
+
+    if stats and (stats.input_tokens or stats.output_tokens):
+        # Context window utilization (input vs context limit)
+        for prefix, ctx in _CONTEXT_WINDOWS.items():
+            if prefix in display_model.lower():
+                parts.append(f"Cont {stats.input_tokens / ctx * 100:.0f}%")
+                break
+
+        # Output token utilization (output vs max_tokens limit)
+        if stats.max_output_tokens and stats.output_tokens:
+            parts.append(f"Tok {stats.output_tokens / stats.max_output_tokens * 100:.0f}%")
+
+        # Cache hit rate (Anthropic only)
+        total_input = stats.input_tokens
+        if total_input > 0 and (stats.cache_read > 0 or stats.cache_created > 0):
+            parts.append(f"Cache {stats.cache_read / total_input * 100:.0f}%")
+
+    return f"\n\n*{' | '.join(parts)}*"
+
+
+# Pattern matching the attribution footer: *— model via provider | ...*
+# Must match all occurrences (model can regurgitate multiple copied lines).
+_ATTRIBUTION_RE = re.compile(r"\n\n\*— .+?( via .+?)?\*")
+
+
+def _strip_attribution_from_history(body: dict) -> dict:
+    """Strip attribution footers from assistant messages in conversation history.
+
+    Prevents the model from seeing the pattern and mimicking it in its
+    response, which would produce duplicate attribution lines in Discord.
+    """
+    body = {**body}
+    messages = body.get("messages", [])
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", "")
+        if isinstance(content, str) and "\u2014 " in content and (" via " in content or "Cont" in content or "Tok" in content):
+            messages[i] = {**msg, "content": _ATTRIBUTION_RE.sub("", content)}
+    return body
+
 
 # ---------------------------------------------------------------------------
 # Format conversion: OpenAI ↔ Anthropic
@@ -218,7 +305,10 @@ def _anthropic_to_openai(response_body: dict, model: str) -> dict:
     }
 
 
-def _anthropic_stream_chunk_to_openai(line: str, model: str) -> str | None:
+def _anthropic_stream_chunk_to_openai(
+    line: str, model: str, stats: UsageStats | None = None,
+    backend: Backend | None = None, include_attribution: bool = True,
+) -> str | None:
     """Convert a single Anthropic SSE line to OpenAI streaming format."""
     if not line.startswith("data: "):
         return None
@@ -234,6 +324,14 @@ def _anthropic_stream_chunk_to_openai(line: str, model: str) -> str | None:
     event_type = event.get("type", "")
 
     if event_type == "message_start":
+        # Extract input usage from Anthropic message_start event
+        msg = event.get("message", {})
+        usage = msg.get("usage", {})
+        if stats is not None:
+            stats.input_tokens = usage.get("input_tokens", 0)
+            stats.cache_read = usage.get("cache_read_input_tokens", 0)
+            stats.cache_created = usage.get("cache_creation_input_tokens", 0)
+            stats.response_model = msg.get("model", "")
         # Initial chunk with role
         chunk = {
             "id": "chatcmpl-router",
@@ -269,22 +367,47 @@ def _anthropic_stream_chunk_to_openai(line: str, model: str) -> str | None:
             }
             return f"data: {json.dumps(chunk)}\n\n"
 
+    elif event_type == "message_delta":
+        delta_usage = event.get("usage", {})
+        if stats is not None:
+            stats.output_tokens = delta_usage.get("output_tokens", 0)
+            # z.ai sends full usage (including input_tokens) in message_delta,
+            # not in message_start — update input_tokens if they were zero.
+            if not stats.input_tokens:
+                stats.input_tokens = delta_usage.get("input_tokens", 0)
+            if not stats.cache_read and not stats.cache_created:
+                stats.cache_read = delta_usage.get("cache_read_input_tokens", 0)
+                stats.cache_created = delta_usage.get("cache_creation_input_tokens", 0)
+        return None
+
     elif event_type == "message_stop":
-        # Final chunk with finish_reason, then [DONE]
+        parts = []
+        # Build attribution from accumulated usage stats
+        if include_attribution and backend is not None and stats is not None:
+            attr = _build_attribution(backend, stats)
+            attr_chunk = {
+                "id": "chatcmpl-router",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {"index": 0, "delta": {"content": attr}, "finish_reason": None}
+                ],
+            }
+            parts.append(f"data: {json.dumps(attr_chunk)}\n\n")
+        # Final chunk with finish_reason
         chunk = {
             "id": "chatcmpl-router",
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": model,
             "choices": [
-                {
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop",
-                }
+                {"index": 0, "delta": {}, "finish_reason": "stop"}
             ],
         }
-        return f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+        parts.append(f"data: {json.dumps(chunk)}\n\n")
+        parts.append("data: [DONE]\n\n")
+        return "".join(parts)
 
     return None
 
@@ -449,10 +572,13 @@ def _normalize_messages(body: dict) -> dict:
     return body
 
 
-async def _proxy_openai(body: dict, backend: Backend, tier_name: str) -> Response:
+async def _proxy_openai(body: dict, backend: Backend, tier_name: str, include_attribution: bool = True) -> Response:
     """Passthrough for OpenAI-compatible backends (Ollama)."""
     is_stream = body.get("stream", False)
     body = _normalize_messages({**body, "model": backend.model})
+    # Request usage stats in streaming responses so we can report token counts
+    if is_stream:
+        body["stream_options"] = {"include_usage": True}
     if backend.max_tokens_cap is not None:
         original = body.get("max_tokens")
         capped = min(original, backend.max_tokens_cap) if original else backend.max_tokens_cap
@@ -467,6 +593,22 @@ async def _proxy_openai(body: dict, backend: Backend, tier_name: str) -> Respons
     if not is_stream:
         async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
             resp = await client.post(backend.url, json=body, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                if include_attribution:
+                    usage = data.get("usage", {})
+                    stats = UsageStats(
+                        input_tokens=usage.get("prompt_tokens", 0),
+                        output_tokens=usage.get("completion_tokens", 0),
+                        max_output_tokens=backend.max_tokens_cap or body.get("max_tokens", 0),
+                        response_model=data.get("model", ""),
+                    )
+                    data["choices"][0]["message"]["content"] += _build_attribution(backend, stats)
+                return Response(
+                    content=json.dumps(data).encode(),
+                    status_code=200,
+                    media_type="application/json",
+                )
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
@@ -475,6 +617,7 @@ async def _proxy_openai(body: dict, backend: Backend, tier_name: str) -> Respons
 
     async def stream_gen():
         t0 = time.time()
+        stats = UsageStats(max_output_tokens=backend.max_tokens_cap or body.get("max_tokens", 0))
         try:
             async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
                 async with client.stream("POST", backend.url, json=body, headers=headers) as resp:
@@ -483,15 +626,47 @@ async def _proxy_openai(body: dict, backend: Backend, tier_name: str) -> Respons
                         log.error("Ollama stream error %d: %s", resp.status_code, error_body.decode(errors="replace")[:300])
                         yield error_body
                         return
-                    async for chunk in resp.aiter_bytes():
-                        yield chunk
+                    async for line in resp.aiter_lines():
+                        if not line.strip():
+                            continue
+                        if line.strip() == "data: [DONE]":
+                            # Inject attribution with accumulated stats before stream end
+                            if include_attribution:
+                                attr = _build_attribution(backend, stats)
+                                attr_chunk = json.dumps({
+                                    "id": "chatcmpl-router",
+                                    "object": "chat.completion.chunk",
+                                    "created": int(time.time()),
+                                    "model": backend.model,
+                                    "choices": [{"index": 0, "delta": {"content": attr}, "finish_reason": None}],
+                                })
+                                yield f"data: {attr_chunk}\n\n".encode()
+                            yield b"data: [DONE]\n\n"
+                        else:
+                            # Try to extract usage + model from chunk
+                            try:
+                                raw = line.strip()
+                                if raw.startswith("data: "):
+                                    chunk_data = json.loads(raw[6:])
+                                    u = chunk_data.get("usage")
+                                    if u:
+                                        if u.get("prompt_tokens"):
+                                            stats.input_tokens = u["prompt_tokens"]
+                                        if u.get("completion_tokens"):
+                                            stats.output_tokens = u["completion_tokens"]
+                                    m = chunk_data.get("model")
+                                    if m:
+                                        stats.response_model = m
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+                            yield (line + "\n\n").encode()
         finally:
             log.info("Streamed %s in %.1fs", tier_name, time.time() - t0)
 
     return StreamingResponse(stream_gen(), media_type="text/event-stream")
 
 
-async def _proxy_anthropic(body: dict, backend: Backend, tier_name: str) -> Response:
+async def _proxy_anthropic(body: dict, backend: Backend, tier_name: str, include_attribution: bool = True) -> Response:
     """Translate OpenAI format → Anthropic Messages API, then translate response back."""
     anthropic_body = _openai_to_anthropic(body, backend.model)
     is_stream = body.get("stream", False)
@@ -511,7 +686,19 @@ async def _proxy_anthropic(body: dict, backend: Backend, tier_name: str) -> Resp
             if resp.status_code != 200:
                 log.error("z.ai error %d: %s", resp.status_code, resp.text[:300])
                 return Response(content=resp.content, status_code=resp.status_code, media_type="application/json")
-            openai_resp = _anthropic_to_openai(resp.json(), backend.model)
+            anthropic_resp = resp.json()
+            openai_resp = _anthropic_to_openai(anthropic_resp, backend.model)
+            if include_attribution:
+                usage = anthropic_resp.get("usage", {})
+                stats = UsageStats(
+                    input_tokens=usage.get("input_tokens", 0),
+                    output_tokens=usage.get("output_tokens", 0),
+                    cache_read=usage.get("cache_read_input_tokens", 0),
+                    cache_created=usage.get("cache_creation_input_tokens", 0),
+                    max_output_tokens=anthropic_body.get("max_tokens", 0),
+                    response_model=anthropic_resp.get("model", ""),
+                )
+                openai_resp["choices"][0]["message"]["content"] += _build_attribution(backend, stats)
             return Response(
                 content=json.dumps(openai_resp).encode(),
                 status_code=200,
@@ -521,6 +708,7 @@ async def _proxy_anthropic(body: dict, backend: Backend, tier_name: str) -> Resp
     # Streaming: translate Anthropic SSE → OpenAI SSE
     async def stream_gen():
         t0 = time.time()
+        stats = UsageStats(max_output_tokens=anthropic_body.get("max_tokens", 0))
         try:
             async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
                 async with client.stream("POST", backend.url, json=anthropic_body, headers=headers) as resp:
@@ -549,12 +737,14 @@ async def _proxy_anthropic(body: dict, backend: Backend, tier_name: str) -> Resp
                             line = line.strip()
                             if not line:
                                 continue
-                            converted = _anthropic_stream_chunk_to_openai(line, backend.model)
+                            converted = _anthropic_stream_chunk_to_openai(
+                                line, backend.model, stats, backend, include_attribution)
                             if converted:
                                 yield converted.encode()
                     # Process remaining buffer
                     if buffer.strip():
-                        converted = _anthropic_stream_chunk_to_openai(buffer.strip(), backend.model)
+                        converted = _anthropic_stream_chunk_to_openai(
+                            buffer.strip(), backend.model, stats, backend, include_attribution)
                         if converted:
                             yield converted.encode()
         finally:
@@ -563,12 +753,12 @@ async def _proxy_anthropic(body: dict, backend: Backend, tier_name: str) -> Resp
     return StreamingResponse(stream_gen(), media_type="text/event-stream")
 
 
-async def proxy_to_backend(body: dict, tier: Tier) -> Response:
+async def proxy_to_backend(body: dict, tier: Tier, include_attribution: bool = True) -> Response:
     """Forward the request to the chosen backend with appropriate format translation."""
     backend = TIERS[tier]
     if backend.api_type == ApiType.ANTHROPIC:
-        return await _proxy_anthropic(body, backend, tier.value)
-    return await _proxy_openai(body, backend, tier.value)
+        return await _proxy_anthropic(body, backend, tier.value, include_attribution)
+    return await _proxy_openai(body, backend, tier.value, include_attribution)
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +766,31 @@ async def proxy_to_backend(body: dict, tier: Tier) -> Response:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="OpenClaw LLM Router")
+
+
+def _is_internal_call(body: dict) -> bool:
+    """Detect OpenClaw internal LLM calls that shouldn't get attribution.
+
+    OpenClaw chains multiple completions per user message — e.g. memory
+    writes ("Pre-compaction memory flush") or tool loops.  We only want
+    the attribution footer on the response the user actually sees, not
+    on background bookkeeping calls.
+
+    Detection: look for OpenClaw's internal-call markers in the messages.
+    """
+    messages = body.get("messages", [])
+    # Check system prompt and recent messages for internal-call signatures
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = _extract_text_content(content)
+        content_lower = content.lower()
+        # OpenClaw memory/tool call patterns
+        if "pre-compaction memory flush" in content_lower:
+            return True
+        if "store durable memories" in content_lower:
+            return True
+    return False
 
 
 def _check_auth(request: Request) -> bool:
@@ -598,6 +813,13 @@ async def chat_completions(request: Request):
         )
 
     body = await request.json()
+    # Strip attribution footers from conversation history so the model
+    # doesn't see and mimic the pattern (causing duplicate lines in Discord)
+    body = _strip_attribution_from_history(body)
+
+    # Detect OpenClaw internal calls (memory flush, tool loops) — skip attribution
+    # on these so only the user-facing response gets the stats footer.
+    _skip_attr = _is_internal_call(body)
 
     user_msg = _extract_user_message(body)
     tier = await classify(user_msg)
@@ -609,7 +831,7 @@ async def chat_completions(request: Request):
         user_msg[:80],
     )
 
-    return await proxy_to_backend(body, tier)
+    return await proxy_to_backend(body, tier, include_attribution=not _skip_attr)
 
 
 @app.get("/v1/models")
