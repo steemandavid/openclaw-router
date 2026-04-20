@@ -2,55 +2,43 @@
 
 ## What was accomplished
 1. **OpenClaw router is working** — Docker container with `network_mode: host`, all three tiers (simple/medium/complex) route correctly
-2. **qwen3:30b** runs on Ollama at **153.7 tok/s** baseline (18GB model, fits RTX 3090 24GB VRAM)
-3. **Router fixes applied** — classifier reads `reasoning` field fallback, max_tokens=200 for classifier, `reasoning` stripped from responses, SIMPLE_MAX_TOKENS=2048
-4. **Ollama updated** from v0.16.3 → v0.21.0 (required for qwen3.6 qwen35moe architecture)
+2. **qwen3:30b** runs on Ollama at **~151 tok/s** baseline (18GB model, fits RTX 3090 24GB VRAM)
+3. **Router fixes committed** — classifier reads `reasoning` field fallback, max_tokens=200 for classifier, `reasoning` stripped from responses, SIMPLE_MAX_TOKENS=2048
+4. **Ollama updated** from v0.16.3 → v0.21.0 (server + client both v0.21.0)
+5. **qwen3.6:35b benchmarked** — best case 32.8 tok/s (num_gpu=37) vs qwen3:30b's 150.8 tok/s. **Verdict: qwen3:30b wins by 4.6x**, stick with it.
+6. **Cleaned up** qwen3-nothink:30b and qwen3.6:35b models (deleted)
+7. **Model storage fixed** — qwen3 models copied from john's personal storage to /storage/ollama/models so systemd service can see them
 
-## What's pending
-1. **Benchmark qwen3.6:35b with CPU offloading** vs qwen3:30b baseline (153.7 tok/s)
-   - qwen3.6:35b is 22.3GB, won't fully fit 24GB VRAM → needs partial CPU offload
-   - Use `num_gpu` option to control GPU/CPU split (40 total layers)
-   - Run same benchmark prompt: "Explain what a recursive function is in 2-3 sentences." with `num_predict=800, temperature=0.3`
-2. **Test nvfp4 variant** — `qwen3.6:35b-a3b-nvfp4` (22GB) should fit fully in RTX 3090
-   - **DO NOT DOWNLOAD DURING DAYTIME** — pull at night only (user preference)
-3. **Clean up** `qwen3-nothink:30b` model (debugging artifact, no longer needed)
+## Current state
+- Router running healthy on port 4100
+- Ollama v0.21.0 running via systemd, listening on 0.0.0.0:11434
+- Classifier: qwen3:30b @ Ollama
+- Simple: qwen3:30b @ Ollama (~151 tok/s)
+- Medium/Complex: claude-sonnet-4-6-20250514 @ z.ai
+- All uncommitted changes committed
 
-## Key files modified
-- `/home/john/projects/openclaw-router/.env` — model config, URLs set to 127.0.0.1, SIMPLE_MAX_TOKENS=2048
-- `/home/john/projects/openclaw-router/docker-compose.yml` — `network_mode: host`
-- `/home/john/projects/openclaw-router/router.py` — classifier reasoning fallback, max_tokens=200, strip reasoning from responses
-
-## Current .env state
-```
-ZAI_API_KEY=7a5d9979d59b4bb8812d3fa7f59e1912.8R0etEtGlD0Dbuxn
-ROUTER_API_KEY=
-OLLAMA_BASE_URL=http://127.0.0.1:11434
-ZAI_BASE_URL=https://api.z.ai/api/anthropic
-CLASSIFIER_MODEL=qwen3:30b
-CLASSIFIER_BASE_URL=http://127.0.0.1:11434
-CLASSIFIER_TIMEOUT=15
-SIMPLE_MODEL=qwen3:30b
-MEDIUM_MODEL=claude-sonnet-4-6-20250514
-COMPLEX_MODEL=claude-sonnet-4-6-20250514
-SIMPLE_MAX_TOKENS=2048
-UPSTREAM_TIMEOUT=180
-PORT=4100
-LOG_LEVEL=INFO
-```
+## Key files
+- `.env` — model config, URLs set to 127.0.0.1, SIMPLE_MAX_TOKENS=2048
+- `docker-compose.yml` — `network_mode: host`
+- `router.py` — classifier reasoning fallback, max_tokens=200, strip reasoning from responses
 
 ## Hardware
 - RTX 3090 24GB VRAM, 62GB RAM
-- Ollama on 127.0.0.1:11434 (localhost only)
+- Ollama on 0.0.0.0:11434 (systemd service)
+
+## Benchmark data (2026-04-20)
+| Model | GPU Layers | tok/s | VRAM |
+|-------|-----------|-------|------|
+| qwen3:30b | all (GPU) | 150.8 | 21.1 GB |
+| qwen3.6:35b | 30 | 21.4 | 19.5 GB |
+| qwen3.6:35b | 35 | 28.5 | 22.4 GB |
+| qwen3.6:35b | 36 | 32.0 | ~23 GB |
+| qwen3.6:35b | 37 | 32.8 | ~23.5 GB |
+| qwen3.6:35b | 38+ | OOM | — |
 
 ## Important notes
 - **Only download Ollama models at night** to spare internet bandwidth
 - qwen3:30b = MoE 30B total / 3B active per token
-- qwen3.6:35b = MoE+SSM hybrid, 35B total, 40 layers, 256 experts (8 active)
 - The router container must use `network_mode: host` because Ollama only listens on 127.0.0.1
-
-## Immediate next steps (pick up here)
-1. Verify Ollama updated: `ollama --version` → should be v0.21.0
-2. Load qwen3.6:35b with CPU offloading: try `num_gpu` values (20, 25, 30) and benchmark each
-3. Compare tok/s with 153.7 baseline — expect significantly slower due to CPU layers
-4. If too slow, schedule nvfp4 pull for nighttime (22GB, should fit GPU fully)
-5. Once best qwen3.6 variant identified, update `.env` SIMPLE_MODEL and CLASSIFIER_MODEL
+- The systemd Ollama service uses `/storage/ollama/models` (configured in override.conf)
+- The nvfp4 variant (qwen3.6:35b-a3b-nvfp4, 22GB) could be tested in the future but would still likely be slower than qwen3:30b due to larger active parameters per token
