@@ -5,18 +5,9 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    ports:
-      - "4100:4100"
-    networks:
-      - openclaw_default
+    network_mode: host
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:4100/health')"]
       interval: 30s
       timeout: 5s
       retries: 3
-
-networks:
-  openclaw_default:
-    external: true

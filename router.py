@@ -440,6 +440,7 @@ complex - coding, debugging, math proofs, multi-step reasoning, data analysis, s
 """
 
 CLASSIFIER_TEMPLATE = """\
+/no_think
 Message: {message}
 
 Classify (simple/medium/complex):"""
@@ -516,7 +517,7 @@ async def classify(message: str) -> Tier:
             {"role": "system", "content": CLASSIFIER_SYSTEM},
             {"role": "user", "content": CLASSIFIER_TEMPLATE.format(message=message[:500])},
         ],
-        "max_tokens": 10,
+        "max_tokens": 200,
         "temperature": 0,
         "stream": False,
     }
@@ -529,7 +530,8 @@ async def classify(message: str) -> Tier:
             )
             resp.raise_for_status()
             data = resp.json()
-            text = data["choices"][0]["message"]["content"]
+            msg = data["choices"][0]["message"]
+            text = msg.get("content", "") or msg.get("reasoning", "")
             tier = _parse_classification(text)
             log.info("Classified as %s (raw: %r)", tier.value, text[:60])
             return tier
@@ -595,6 +597,10 @@ async def _proxy_openai(body: dict, backend: Backend, tier_name: str, include_at
             resp = await client.post(backend.url, json=body, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
+                # Strip reasoning/thinking fields from Ollama responses
+                # (Qwen3 thinking models put chain-of-thought in "reasoning")
+                for choice in data.get("choices", []):
+                    choice.get("message", {}).pop("reasoning", None)
                 if include_attribution:
                     usage = data.get("usage", {})
                     stats = UsageStats(
