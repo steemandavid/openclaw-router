@@ -1,44 +1,40 @@
-# OpenClaw Router Session Context (2026-04-20)
+# OpenClaw Router Session Context (2026-04-21)
 
 ## What was accomplished
-1. **OpenClaw router is working** — Docker container with `network_mode: host`, all three tiers (simple/medium/complex) route correctly
-2. **qwen3:30b** runs on Ollama at **~151 tok/s** baseline (18GB model, fits RTX 3090 24GB VRAM)
-3. **Router fixes committed** — classifier reads `reasoning` field fallback, max_tokens=200 for classifier, `reasoning` stripped from responses, SIMPLE_MAX_TOKENS=2048
-4. **Ollama updated** from v0.16.3 → v0.21.0 (server + client both v0.21.0)
-5. **qwen3.6:35b benchmarked** — best case 32.8 tok/s (num_gpu=37) vs qwen3:30b's 150.8 tok/s. **Verdict: qwen3:30b wins by 4.6x**, stick with it.
-6. **Cleaned up** qwen3-nothink:30b and qwen3.6:35b models (deleted)
-7. **Model storage fixed** — qwen3 models copied from john's personal storage to /storage/ollama/models so systemd service can see them
+1. **Streaming attribution footer working** — model info footer now appears in Discord responses from kreeft
+2. **Tool calling enabled** — stopped stripping `tools`/`tool_choice` from Ollama requests; qwen3.6 supports native tool calling
+3. **Fixed internal call detection** — only checks last 5 messages (was checking full history, causing false positives from old memory flush markers)
+4. **Fixed empty thinking-phase chunks** — qwen3.6 thinking tokens no longer leak as empty content chunks in stream
+5. **Classifier retry logic** — 3 attempts with escalating delays for Ollama connection drops
+6. **OpenClaw container restart** — fixed Discord gateway connection issue (full stop/start needed, not just restart)
+7. **All changes committed and pushed** to origin/main
 
 ## Current state
-- Router running healthy on port 4100
-- Ollama v0.21.0 running via systemd, listening on 0.0.0.0:11434
-- Classifier: qwen3:30b @ Ollama
-- Simple: qwen3:30b @ Ollama (~151 tok/s)
+- Router running healthy on VM port 4100 (192.168.1.174)
+- Ollama v0.21.0 running via systemd on host (192.168.1.165:11434)
+- Classifier: qwen3.6:35b-a3b-q4_K_M @ Ollama
+- Simple: qwen3.6:35b-a3b-q4_K_M @ Ollama (with OLLAMA_NUM_GPU=30 for CPU offloading)
 - Medium/Complex: claude-sonnet-4-6-20250514 @ z.ai
-- All uncommitted changes committed
+- OpenClaw "kreeft" bot connected to Discord and responding with attribution footer
 
-## Key files
-- `.env` — model config, URLs set to 127.0.0.1, SIMPLE_MAX_TOKENS=2048
-- `docker-compose.yml` — `network_mode: host`
-- `router.py` — classifier reasoning fallback, max_tokens=200, strip reasoning from responses
+## Architecture
+- **Host** (192.168.1.165): Ollama + host router (port 4100, for direct testing)
+- **VM** (192.168.1.174): OpenClaw + VM router (port 4100, what kreeft uses)
+- OpenClaw sends requests to `router:4100` (Docker network) → router classifies → routes to Ollama or z.ai
+- Changes must be synced: edit local router.py → scp to VM → docker compose build --no-cache
+
+## Key fixes applied (2026-04-21)
+- **Footer not showing**: Three root causes found: (1) empty thinking chunks flooding the stream, (2) attribution chunk had different ID than other chunks, (3) `_is_internal_call()` scanned entire 50+ message history and found old "pre-compaction memory flush" markers, suppressing attribution on ALL requests
+- **Tool call failures**: Router was stripping tools from Ollama requests, but qwen3.6 supports them natively
+- **Discord gateway stuck**: "awaiting gateway readiness" → fixed with full `docker stop` + `docker start` (not just `restart`)
 
 ## Hardware
 - RTX 3090 24GB VRAM, 62GB RAM
 - Ollama on 0.0.0.0:11434 (systemd service)
-
-## Benchmark data (2026-04-20)
-| Model | GPU Layers | tok/s | VRAM |
-|-------|-----------|-------|------|
-| qwen3:30b | all (GPU) | 150.8 | 21.1 GB |
-| qwen3.6:35b | 30 | 21.4 | 19.5 GB |
-| qwen3.6:35b | 35 | 28.5 | 22.4 GB |
-| qwen3.6:35b | 36 | 32.0 | ~23 GB |
-| qwen3.6:35b | 37 | 32.8 | ~23.5 GB |
-| qwen3.6:35b | 38+ | OOM | — |
+- OLLAMA_NUM_GPU=30, OLLAMA_KV_CACHE_TYPE=q4_0
 
 ## Important notes
-- **Only download Ollama models at night** to spare internet bandwidth
-- qwen3:30b = MoE 30B total / 3B active per token
-- The router container must use `network_mode: host` because Ollama only listens on 127.0.0.1
-- The systemd Ollama service uses `/storage/ollama/models` (configured in override.conf)
-- The nvfp4 variant (qwen3.6:35b-a3b-nvfp4, 22GB) could be tested in the future but would still likely be slower than qwen3:30b due to larger active parameters per token
+- Only download Ollama models at night to spare internet bandwidth
+- qwen3:30b was faster (151 tok/s) but replaced by qwen3.6:35b-a3b-q4_K_M for tool support
+- nvfp4 quantized models require macOS — not available on Linux/NVIDIA
+- VM router is the production instance; host router is for testing
