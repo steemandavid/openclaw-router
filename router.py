@@ -495,8 +495,19 @@ def _strip_openclaw_metadata(text: str) -> str:
 
 
 def _parse_classification(text: str) -> Tier:
-    """Parse the one-word classification from the LLM response."""
+    """Parse the one-word classification from the LLM response.
+
+    Thinking models put the reasoning first and the answer at the end.
+    Check the tail of the text first to avoid false matches from the
+    thinking process (which mentions all tier names when analyzing).
+    """
     text = text.strip().lower()
+    # Check the last 80 chars first — that's where the actual answer is
+    tail = text[-80:] if len(text) > 80 else text
+    for tier in Tier:
+        if tier.value in tail:
+            return tier
+    # Fallback: check full text
     for tier in Tier:
         if tier.value in text:
             return tier
@@ -518,7 +529,7 @@ async def classify(message: str) -> Tier:
             {"role": "system", "content": CLASSIFIER_SYSTEM},
             {"role": "user", "content": CLASSIFIER_TEMPLATE.format(message=message[:500])},
         ],
-        "max_tokens": 200,
+        "max_tokens": 500,
         "temperature": 0,
         "stream": False,
     }
