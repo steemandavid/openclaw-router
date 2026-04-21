@@ -601,6 +601,7 @@ async def _proxy_openai(body: dict, backend: Backend, tier_name: str, include_at
                 # (Qwen3 thinking models put chain-of-thought in "reasoning")
                 for choice in data.get("choices", []):
                     choice.get("message", {}).pop("reasoning", None)
+                    choice.get("message", {}).pop("thinking", None)
                 if include_attribution:
                     usage = data.get("usage", {})
                     stats = UsageStats(
