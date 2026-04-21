@@ -18,6 +18,7 @@ import os
 import re
 import time
 import json
+import asyncio
 import logging
 from enum import Enum
 from dataclasses import dataclass
@@ -522,22 +523,29 @@ async def classify(message: str) -> Tier:
         "stream": False,
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=CLASSIFIER_TIMEOUT) as client:
-            resp = await client.post(
-                f"{CLASSIFIER_BASE_URL}/v1/chat/completions",
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            msg = data["choices"][0]["message"]
-            text = msg.get("content", "") or msg.get("reasoning", "")
-            tier = _parse_classification(text)
-            log.info("Classified as %s (raw: %r)", tier.value, text[:60])
-            return tier
-    except Exception as exc:
-        log.warning("Classifier failed (%s), defaulting to medium", exc)
-        return Tier.MEDIUM
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=CLASSIFIER_TIMEOUT) as client:
+                resp = await client.post(
+                    f"{CLASSIFIER_BASE_URL}/v1/chat/completions",
+                    json=payload,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                msg = data["choices"][0]["message"]
+                text = msg.get("content", "") or msg.get("reasoning", "")
+                tier = _parse_classification(text)
+                log.info("Classified as %s (raw: %r)", tier.value, text[:60])
+                return tier
+        except Exception as exc:
+            if attempt < max_retries:
+                wait = attempt * 3
+                log.warning("Classifier failed attempt %d/%d (%s), retrying in %ds", attempt, max_retries, exc, wait)
+                await asyncio.sleep(wait)
+            else:
+                log.warning("Classifier failed after %d attempts (%s), defaulting to medium", max_retries, exc)
+                return Tier.MEDIUM
 
 
 # ---------------------------------------------------------------------------
@@ -546,8 +554,6 @@ async def classify(message: str) -> Tier:
 
 
 _OLLAMA_UNSUPPORTED_FIELDS = (
-    "tools",
-    "tool_choice",
     "thinking",
     "thinking_budget",
     "reasoning_effort",
@@ -602,7 +608,9 @@ async def _proxy_openai(body: dict, backend: Backend, tier_name: str, include_at
                 for choice in data.get("choices", []):
                     choice.get("message", {}).pop("reasoning", None)
                     choice.get("message", {}).pop("thinking", None)
-                if include_attribution:
+                # Only add attribution on final text responses, not tool calls
+                is_tool_call = data.get("choices", [{}])[0].get("finish_reason") == "tool_calls"
+                if include_attribution and not is_tool_call:
                     usage = data.get("usage", {})
                     stats = UsageStats(
                         input_tokens=usage.get("prompt_tokens", 0),
@@ -625,6 +633,7 @@ async def _proxy_openai(body: dict, backend: Backend, tier_name: str, include_at
     async def stream_gen():
         t0 = time.time()
         stats = UsageStats(max_output_tokens=backend.max_tokens_cap or body.get("max_tokens", 0))
+        saw_stop = saw_tool = added_attr = False
         try:
             async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT) as client:
                 async with client.stream("POST", backend.url, json=body, headers=headers) as resp:
@@ -637,20 +646,11 @@ async def _proxy_openai(body: dict, backend: Backend, tier_name: str, include_at
                         if not line.strip():
                             continue
                         if line.strip() == "data: [DONE]":
-                            # Inject attribution with accumulated stats before stream end
-                            if include_attribution:
-                                attr = _build_attribution(backend, stats)
-                                attr_chunk = json.dumps({
-                                    "id": "chatcmpl-router",
-                                    "object": "chat.completion.chunk",
-                                    "created": int(time.time()),
-                                    "model": backend.model,
-                                    "choices": [{"index": 0, "delta": {"content": attr}, "finish_reason": None}],
-                                })
-                                yield f"data: {attr_chunk}\n\n".encode()
                             yield b"data: [DONE]\n\n"
                         else:
                             # Try to extract usage + model from chunk
+                            # Also strip reasoning/thinking fields from delta
+                            # and skip chunks with no meaningful content (thinking phase)
                             try:
                                 raw = line.strip()
                                 if raw.startswith("data: "):
@@ -664,11 +664,48 @@ async def _proxy_openai(body: dict, backend: Backend, tier_name: str, include_at
                                     m = chunk_data.get("model")
                                     if m:
                                         stats.response_model = m
+                                    # Strip reasoning/thinking from all chunks
+                                    has_content = False
+                                    is_tool_call = False
+                                    for choice in chunk_data.get("choices", []):
+                                        delta = choice.get("delta", {})
+                                        delta.pop("reasoning", None)
+                                        delta.pop("thinking", None)
+                                        if delta.get("content"):
+                                            has_content = True
+                                        if delta.get("tool_calls") or choice.get("finish_reason") == "tool_calls":
+                                            is_tool_call = True
+                                            saw_tool = True
+                                    # Check if this is the stop chunk
+                                    is_stop = any(
+                                        c.get("finish_reason") == "stop"
+                                        for c in chunk_data.get("choices", [])
+                                    )
+                                    if is_stop:
+                                        saw_stop = True
+                                    # Skip empty-content chunks (thinking phase)
+                                    # But keep tool call chunks and the stop chunk
+                                    if not has_content and not is_stop and not is_tool_call:
+                                        continue
+                                    # Inject attribution BEFORE the stop chunk (only on final text responses)
+                                    if is_stop and include_attribution and not is_tool_call:
+                                        stream_id = chunk_data.get("id", "chatcmpl-router")
+                                        attr = _build_attribution(backend, stats)
+                                        attr_chunk = json.dumps({
+                                            "id": stream_id,
+                                            "object": "chat.completion.chunk",
+                                            "created": chunk_data.get("created", int(time.time())),
+                                            "model": backend.model,
+                                            "choices": [{"index": 0, "delta": {"role": "assistant", "content": attr}, "finish_reason": None}],
+                                        })
+                                        added_attr = True
+                                        yield f"data: {attr_chunk}\n\n".encode()
+                                    yield ("data: " + json.dumps(chunk_data) + "\n\n").encode()
                             except (json.JSONDecodeError, KeyError):
                                 pass
-                            yield (line + "\n\n").encode()
         finally:
-            log.info("Streamed %s in %.1fs", tier_name, time.time() - t0)
+            log.info("Streamed %s in %.1fs stop=%s tool=%s attr=%s",
+                     tier_name, time.time() - t0, saw_stop, saw_tool, added_attr)
 
     return StreamingResponse(stream_gen(), media_type="text/event-stream")
 
@@ -786,16 +823,21 @@ def _is_internal_call(body: dict) -> bool:
     Detection: look for OpenClaw's internal-call markers in the messages.
     """
     messages = body.get("messages", [])
-    # Check system prompt and recent messages for internal-call signatures
-    for msg in messages:
+    # Only check the last few messages — old history may contain memory
+    # flush markers from earlier in the conversation, but those are not
+    # internal calls for the current request.
+    recent = messages[-5:] if len(messages) > 5 else messages
+    for msg in recent:
         content = msg.get("content", "")
         if isinstance(content, list):
             content = _extract_text_content(content)
         content_lower = content.lower()
         # OpenClaw memory/tool call patterns
         if "pre-compaction memory flush" in content_lower:
+            log.debug("Internal call detected: 'pre-compaction memory flush' in msg role=%s", msg.get("role"))
             return True
         if "store durable memories" in content_lower:
+            log.debug("Internal call detected: 'store durable memories' in msg role=%s", msg.get("role"))
             return True
     return False
 
