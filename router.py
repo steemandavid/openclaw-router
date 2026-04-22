@@ -853,7 +853,7 @@ def _is_internal_call(body: dict) -> bool:
     # internal calls for the current request.
     recent = messages[-5:] if len(messages) > 5 else messages
     for msg in recent:
-        content = msg.get("content", "")
+        content = msg.get("content") or ""
         if isinstance(content, list):
             content = _extract_text_content(content)
         content_lower = content.lower()

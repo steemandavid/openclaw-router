@@ -1,6 +1,10 @@
-# OpenClaw Router Session Context (2026-04-21)
+# OpenClaw Router Session Context (2026-04-22)
 
-## What was accomplished
+## What was accomplished (2026-04-22)
+1. **Fixed HTTP 500 crash in `_is_internal_call()`** — messages with `"content": null` caused `AttributeError: 'NoneType' object has no attribute 'lower'` because `msg.get("content", "")` returns `None` when key exists but value is null. Fixed with `msg.get("content") or ""`.
+2. **Deployed fix to VM** — rebuilt and restarted openclaw-router container, verified healthy
+
+## What was accomplished (2026-04-21)
 1. **Streaming attribution footer working** — model info footer now appears in Discord responses from kreeft
 2. **Tool calling enabled** — stopped stripping `tools`/`tool_choice` from Ollama requests; qwen3.6 supports native tool calling
 3. **Fixed internal call detection** — only checks last 5 messages (was checking full history, causing false positives from old memory flush markers)
@@ -22,6 +26,9 @@
 - **VM** (192.168.1.174): OpenClaw + VM router (port 4100, what kreeft uses)
 - OpenClaw sends requests to `router:4100` (Docker network) → router classifies → routes to Ollama or z.ai
 - Changes must be synced: edit local router.py → scp to VM → docker compose build --no-cache
+
+## Key fixes applied (2026-04-22)
+- **HTTP 500 on null content**: `_is_internal_call()` crashed when a message had `"content": null`. `msg.get("content", "")` returns `None` (not `""`) when the key exists with a null value, so `.lower()` raised `AttributeError`. Fixed by using `msg.get("content") or ""`.
 
 ## Key fixes applied (2026-04-21)
 - **Footer not showing**: Three root causes found: (1) empty thinking chunks flooding the stream, (2) attribution chunk had different ID than other chunks, (3) `_is_internal_call()` scanned entire 50+ message history and found old "pre-compaction memory flush" markers, suppressing attribution on ALL requests
