@@ -426,12 +426,16 @@ simple - casual chat, greetings, opinions, yes/no, trivial questions:
   "thanks!" -> simple
   "tell me a joke" -> simple
 
-medium - factual questions, explanations, summaries, how-to, translations, comparisons:
+medium - factual questions, explanations, summaries, HOW-TO instructions, translations, comparisons, recipes:
   "what is a VPN and when should I use one?" -> medium
   "explain how DNS works" -> medium
   "summarize this article" -> medium
   "translate hello to French" -> medium
+  "how do I bake chocolate chip cookies?" -> medium
+  "translate 'hello world' to French" -> medium
   "what's the difference between TCP and UDP?" -> medium
+  "how do I change a tire?" -> medium
+  "what are the symptoms of the flu?" -> medium
 
 complex - coding, debugging, math proofs, multi-step reasoning, data analysis, system design:
   "write a Python function that implements binary search" -> complex
@@ -522,6 +526,16 @@ async def classify(message: str) -> Tier:
     """Send the message to the classifier model and return the tier."""
     if not message.strip():
         return Tier.SIMPLE
+
+    # Keyword overrides for patterns the small classifier model misses.
+    msg_lower = message.lower()
+    if any(kw in msg_lower for kw in (
+        "translate", "translation",
+        "how do i ", "how do you ", "how to ",
+        "recipe for",
+    )):
+        log.info("Keyword override → medium for: %s", message[:80])
+        return Tier.MEDIUM
 
     payload = {
         "model": CLASSIFIER_MODEL,
